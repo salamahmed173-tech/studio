@@ -719,147 +719,144 @@ def main():
                 out_csv = os.path.join(args.outdir, 'forecast_ensemble.csv')
                 out_df.to_csv(out_csv, index=False)
                 print('Ensemble forecast saved to', out_csv)
-                # Attempt stacking (OOF stacking with Ridge meta-learner) if enough history
+                # Attempt stacking (OOF stacking with Ridge meta-learner)
                 try:
                     from sklearn.linear_model import RidgeCV
-                    if len(monthly) < 36:
-                        print('Not enough history for robust stacking (need >=36 months). Skipping stacking.')
+
+                    # adapt folds and horizon to available history
+                    horizon_oof = min(6, max(1, len(monthly) // 8))
+                    n_splits = min(5, max(2, len(monthly) // (horizon_oof * 2)))
+                    print(f'Running OOF stacking with Ridge meta-learner (n_splits={n_splits}, horizon={horizon_oof})...')
+
+                    oof_X = []
+                    oof_y = []
+                    for split in range(n_splits):
+                        split_end = len(monthly) - (n_splits - split) * horizon_oof
+                        if split_end <= 6:
+                            continue
+                        train_df = monthly.iloc[:split_end].copy()
+                        val_df = monthly.iloc[split_end:split_end + horizon_oof].copy()
+                        preds_split = []
+
+                        # Prophet
+                        try:
+                            m = Prophet(changepoint_prior_scale=best_prop_big.get('changepoint_prior_scale', 0.05), seasonality_prior_scale=best_prop_big.get('seasonality_prior_scale', 5.0), seasonality_mode='additive', yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
+                            m.fit(train_df)
+                            future = m.make_future_dataframe(periods=horizon_oof, freq='MS')
+                            fc = m.predict(future)
+                            p_prop = fc.set_index('ds')['yhat'].reindex(val_df['ds']).values
+                        except Exception:
+                            p_prop = np.full(len(val_df), np.nan)
+                        preds_split.append(p_prop)
+
+                        # lag-based GBM/XGB
+                        try:
+                            lags = 6
+                            df_lag = prepare_lags(monthly, lags=lags)
+                            train_lag = df_lag.iloc[:split_end]
+                            val_lag = df_lag.iloc[split_end:split_end + horizon_oof]
+                            X_tr = train_lag[[f'lag_{i}' for i in range(1, lags+1)]].values
+                            y_tr = train_lag['y'].values
+                            X_val = val_lag[[f'lag_{i}' for i in range(1, lags+1)]].values
+
+                            g = GradientBoostingRegressor(n_estimators=best_gbm_big.get('n_estimators',100), max_depth=best_gbm_big.get('max_depth',2), learning_rate=best_gbm_big.get('learning_rate',0.05))
+                            g.fit(X_tr, y_tr)
+                            p_g = g.predict(X_val)
+                        except Exception:
+                            p_g = np.full(len(val_df), np.nan)
+                        preds_split.append(p_g)
+
+                        try:
+                            x = XGBRegressor(n_estimators=best_xgb_big.get('n_estimators',100), learning_rate=best_xgb_big.get('learning_rate',0.1), verbosity=0)
+                            x.fit(X_tr, y_tr)
+                            p_x = x.predict(X_val)
+                        except Exception:
+                            p_x = np.full(len(val_df), np.nan)
+                        preds_split.append(p_x)
+
+                        # SARIMA
+                        try:
+                            monthly_idx = monthly.set_index('ds').asfreq('MS')
+                            train_series = monthly_idx.iloc[:split_end]['y']
+                            sar = SARIMAX(train_series, order=best_sarima_big.get('order',(1,1,1)), seasonal_order=best_sarima_big.get('seasonal_order',(0,1,1,12)), enforce_stationarity=False, enforce_invertibility=False)
+                            res = sar.fit(disp=False)
+                            p_s = res.get_forecast(steps=horizon_oof).predicted_mean.values
+                        except Exception:
+                            p_s = np.full(len(val_df), np.nan)
+                        preds_split.append(p_s)
+
+                        stacked = np.vstack(preds_split).T
+                        oof_X.append(stacked)
+                        oof_y.append(val_df['y'].values.reshape(-1,1))
+
+                    if len(oof_X) == 0:
+                        print('OOF stacking had no valid folds; skipping.')
                     else:
-                        print('Running OOF stacking with Ridge meta-learner (n_splits=5, horizon=6)...')
-                        n_splits = 5
-                        horizon_oof = 6
-                        oof_X = []
-                        oof_y = []
-                        for split in range(n_splits):
-                            split_end = len(monthly) - (n_splits - split) * horizon_oof
-                            if split_end <= 12:
-                                continue
-                            train_df = monthly.iloc[:split_end].copy()
-                            val_df = monthly.iloc[split_end:split_end + horizon_oof].copy()
-                            preds_split = []
+                        X_meta = np.vstack(oof_X)
+                        y_meta = np.vstack(oof_y).ravel()
+                        col_mask = ~np.all(np.isnan(X_meta), axis=0)
+                        X_meta = X_meta[:, col_mask]
+                        col_mean = np.nanmean(X_meta, axis=0)
+                        inds = np.where(np.isnan(X_meta))
+                        X_meta[inds] = np.take(col_mean, inds[1])
 
-                            # Prophet
-                            try:
-                                m = Prophet(changepoint_prior_scale=best_prop_big.get('changepoint_prior_scale', 0.05), seasonality_prior_scale=best_prop_big.get('seasonality_prior_scale', 5.0), seasonality_mode='additive', yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
-                                m.fit(train_df)
-                                future = m.make_future_dataframe(periods=horizon_oof, freq='MS')
-                                fc = m.predict(future)
-                                p_prop = fc.set_index('ds')['yhat'].reindex(val_df['ds']).values
-                            except Exception:
-                                p_prop = np.full(len(val_df), np.nan)
-                            preds_split.append(p_prop)
+                        meta = RidgeCV(alphas=[0.1, 1.0, 10.0])
+                        meta.fit(X_meta, y_meta)
+                        print('Stacking meta coefficients:', meta.coef_)
 
-                            # lag-based GBM/XGB
-                            try:
-                                lags = 6
-                                df_lag = prepare_lags(monthly, lags=lags)
-                                train_lag = df_lag.iloc[:split_end]
-                                val_lag = df_lag.iloc[split_end:split_end + horizon_oof]
-                                X_tr = train_lag[[f'lag_{i}' for i in range(1, lags+1)]].values
-                                y_tr = train_lag['y'].values
-                                X_val = val_lag[[f'lag_{i}' for i in range(1, lags+1)]].values
+                        # prepare holdout stacked inputs
+                        hold_preds = []
+                        try:
+                            m = Prophet(changepoint_prior_scale=best_prop_big.get('changepoint_prior_scale', 0.05), seasonality_prior_scale=best_prop_big.get('seasonality_prior_scale', 5.0), seasonality_mode='additive', yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
+                            m.fit(monthly.iloc[:-horizon])
+                            future = m.make_future_dataframe(periods=horizon, freq='MS')
+                            fc = m.predict(future)
+                            p_prop_full = fc.set_index('ds')['yhat'].reindex(holdout_df['ds']).values
+                        except Exception:
+                            p_prop_full = np.full(horizon, np.nan)
+                        hold_preds.append(p_prop_full)
 
-                                g = GradientBoostingRegressor(n_estimators=best_gbm_big.get('n_estimators',100), max_depth=best_gbm_big.get('max_depth',2), learning_rate=best_gbm_big.get('learning_rate',0.05))
-                                g.fit(X_tr, y_tr)
-                                p_g = g.predict(X_val)
-                            except Exception:
-                                p_g = np.full(len(val_df), np.nan)
-                            preds_split.append(p_g)
+                        try:
+                            lags = 6
+                            df_lag = prepare_lags(monthly, lags=lags)
+                            train_lag = df_lag.iloc[:len(df_lag)-horizon]
+                            hold_lag = df_lag.iloc[len(df_lag)-horizon:]
+                            X_trf = train_lag[[f'lag_{i}' for i in range(1, lags+1)]].values
+                            y_trf = train_lag['y'].values
+                            g = GradientBoostingRegressor(n_estimators=best_gbm_big.get('n_estimators',100), max_depth=best_gbm_big.get('max_depth',2), learning_rate=best_gbm_big.get('learning_rate',0.05))
+                            g.fit(X_trf, y_trf)
+                            p_g_full = g.predict(hold_lag[[f'lag_{i}' for i in range(1, lags+1)]].values)
+                        except Exception:
+                            p_g_full = np.full(horizon, np.nan)
+                        hold_preds.append(p_g_full)
 
-                            try:
-                                x = XGBRegressor(n_estimators=best_xgb_big.get('n_estimators',100), learning_rate=best_xgb_big.get('learning_rate',0.1), verbosity=0)
-                                x.fit(X_tr, y_tr)
-                                p_x = x.predict(X_val)
-                            except Exception:
-                                p_x = np.full(len(val_df), np.nan)
-                            preds_split.append(p_x)
+                        try:
+                            x = XGBRegressor(n_estimators=best_xgb_big.get('n_estimators',100), learning_rate=best_xgb_big.get('learning_rate',0.1), verbosity=0)
+                            x.fit(X_trf, y_trf)
+                            p_x_full = x.predict(hold_lag[[f'lag_{i}' for i in range(1, lags+1)]].values)
+                        except Exception:
+                            p_x_full = np.full(horizon, np.nan)
+                        hold_preds.append(p_x_full)
 
-                            # SARIMA
-                            try:
-                                monthly_idx = monthly.set_index('ds').asfreq('MS')
-                                train_series = monthly_idx.iloc[:split_end]['y']
-                                sar = SARIMAX(train_series, order=best_sarima_big.get('order',(1,1,1)), seasonal_order=best_sarima_big.get('seasonal_order',(0,1,1,12)), enforce_stationarity=False, enforce_invertibility=False)
-                                res = sar.fit(disp=False)
-                                p_s = res.get_forecast(steps=horizon_oof).predicted_mean.values
-                            except Exception:
-                                p_s = np.full(len(val_df), np.nan)
-                            preds_split.append(p_s)
+                        try:
+                            sar = SARIMAX(monthly.set_index('ds').asfreq('MS')[:-horizon]['y'], order=best_sarima_big.get('order',(1,1,1)), seasonal_order=best_sarima_big.get('seasonal_order',(0,1,1,12)), enforce_stationarity=False, enforce_invertibility=False)
+                            res = sar.fit(disp=False)
+                            p_s_full = res.get_forecast(steps=horizon).predicted_mean.values
+                        except Exception:
+                            p_s_full = np.full(horizon, np.nan)
+                        hold_preds.append(p_s_full)
 
-                            stacked = np.vstack(preds_split).T
-                            oof_X.append(stacked)
-                            oof_y.append(val_df['y'].values.reshape(-1,1))
-
-                        if len(oof_X) == 0:
-                            print('OOF stacking had no valid folds; skipping.')
-                        else:
-                            X_meta = np.vstack(oof_X)
-                            y_meta = np.vstack(oof_y).ravel()
-                            col_mask = ~np.all(np.isnan(X_meta), axis=0)
-                            X_meta = X_meta[:, col_mask]
-                            col_mean = np.nanmean(X_meta, axis=0)
-                            inds = np.where(np.isnan(X_meta))
-                            X_meta[inds] = np.take(col_mean, inds[1])
-
-                            meta = RidgeCV(alphas=[0.1, 1.0, 10.0])
-                            meta.fit(X_meta, y_meta)
-                            print('Stacking meta coefficients:', meta.coef_)
-
-                            # prepare holdout stacked inputs
-                            # retrain base models on train_df = monthly[:-horizon] and predict holdout
-                            hold_preds = []
-                            # prophet full
-                            try:
-                                m = Prophet(changepoint_prior_scale=best_prop_big.get('changepoint_prior_scale', 0.05), seasonality_prior_scale=best_prop_big.get('seasonality_prior_scale', 5.0), seasonality_mode='additive', yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
-                                m.fit(monthly.iloc[:-horizon])
-                                future = m.make_future_dataframe(periods=horizon, freq='MS')
-                                fc = m.predict(future)
-                                p_prop_full = fc.set_index('ds')['yhat'].reindex(holdout_df['ds']).values
-                            except Exception:
-                                p_prop_full = np.full(horizon, np.nan)
-                            hold_preds.append(p_prop_full)
-
-                            # gbm/xgb full
-                            try:
-                                lags = 6
-                                df_lag = prepare_lags(monthly, lags=lags)
-                                train_lag = df_lag.iloc[:len(df_lag)-horizon]
-                                hold_lag = df_lag.iloc[len(df_lag)-horizon:]
-                                X_trf = train_lag[[f'lag_{i}' for i in range(1, lags+1)]].values
-                                y_trf = train_lag['y'].values
-                                g = GradientBoostingRegressor(n_estimators=best_gbm_big.get('n_estimators',100), max_depth=best_gbm_big.get('max_depth',2), learning_rate=best_gbm_big.get('learning_rate',0.05))
-                                g.fit(X_trf, y_trf)
-                                p_g_full = g.predict(hold_lag[[f'lag_{i}' for i in range(1, lags+1)]].values)
-                            except Exception:
-                                p_g_full = np.full(horizon, np.nan)
-                            hold_preds.append(p_g_full)
-
-                            try:
-                                x = XGBRegressor(n_estimators=best_xgb_big.get('n_estimators',100), learning_rate=best_xgb_big.get('learning_rate',0.1), verbosity=0)
-                                x.fit(X_trf, y_trf)
-                                p_x_full = x.predict(hold_lag[[f'lag_{i}' for i in range(1, lags+1)]].values)
-                            except Exception:
-                                p_x_full = np.full(horizon, np.nan)
-                            hold_preds.append(p_x_full)
-
-                            try:
-                                sar = SARIMAX(monthly.set_index('ds').asfreq('MS')[:-horizon]['y'], order=best_sarima_big.get('order',(1,1,1)), seasonal_order=best_sarima_big.get('seasonal_order',(0,1,1,12)), enforce_stationarity=False, enforce_invertibility=False)
-                                res = sar.fit(disp=False)
-                                p_s_full = res.get_forecast(steps=horizon).predicted_mean.values
-                            except Exception:
-                                p_s_full = np.full(horizon, np.nan)
-                            hold_preds.append(p_s_full)
-
-                            stacked_hold = np.vstack(hold_preds).T
-                            stacked_hold = stacked_hold[:, col_mask]
-                            inds = np.where(np.isnan(stacked_hold))
-                            stacked_hold[inds] = np.take(col_mean, inds[1])
-                            ens_meta = meta.predict(stacked_hold)
-                            ens_meta_rmse = float(np.sqrt(np.mean((holdout_df['y'].values - ens_meta) ** 2)))
-                            print('Stacking ensemble RMSE on holdout:', ens_meta_rmse)
-                            out_df2 = pd.DataFrame({'ds': future_index, 'yhat_stacked': ens_meta})
-                            out_csv2 = os.path.join(args.outdir, 'forecast_stacked.csv')
-                            out_df2.to_csv(out_csv2, index=False)
-                            print('Stacked forecast saved to', out_csv2)
+                        stacked_hold = np.vstack(hold_preds).T
+                        stacked_hold = stacked_hold[:, col_mask]
+                        inds = np.where(np.isnan(stacked_hold))
+                        stacked_hold[inds] = np.take(col_mean, inds[1])
+                        ens_meta = meta.predict(stacked_hold)
+                        ens_meta_rmse = float(np.sqrt(np.mean((holdout_df['y'].values - ens_meta) ** 2)))
+                        print('Stacking ensemble RMSE on holdout:', ens_meta_rmse)
+                        out_df2 = pd.DataFrame({'ds': future_index, 'yhat_stacked': ens_meta})
+                        out_csv2 = os.path.join(args.outdir, 'forecast_stacked.csv')
+                        out_df2.to_csv(out_csv2, index=False)
+                        print('Stacked forecast saved to', out_csv2)
                 except Exception as e:
                     print('Stacking failed:', e)
 
